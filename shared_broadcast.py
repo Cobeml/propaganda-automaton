@@ -50,6 +50,11 @@ class SharedRadioBroadcast:
 
         self.chunk_size = chunk_size
         self.buffer_size = buffer_size
+        self.sample_rate = 24000  # Match audio_mixer sample rate
+        
+        # Calculate seconds per chunk for playback time tracking
+        # chunk_size is in samples, sample_rate is samples per second
+        self.seconds_per_chunk = chunk_size / self.sample_rate
 
         # Circular buffer to store recent chunks
         self.buffer = deque(maxlen=buffer_size)
@@ -64,6 +69,12 @@ class SharedRadioBroadcast:
         self.last_broadcast_seq = -1
         self.broadcast_track = None
         self.broadcast_paused = False
+        
+        # Track playback position for logging (based on actual playback time)
+        self.playback_chunks_sent = 0
+        self.last_logged_track = None
+        self.last_logged_paused = None
+        self.last_log_time = time.time()
 
         # Background task
         self.broadcast_task = None
@@ -91,16 +102,38 @@ class SharedRadioBroadcast:
                 pass
             print("📻 Shared broadcast stopped")
 
+    def _check_and_log_state_change(self, new_track: str, new_paused: bool):
+        """
+        Check if state has changed and log it.
+        This ensures we only log once per state change, not per chunk.
+        """
+        # Track state changes based on what's being added to buffer
+        # We log when we START generating a new track/pause, which represents
+        # what will be played soon (since generation is slightly ahead of playback)
+        if new_track != self.last_logged_track:
+            print(f"🎵 Now playing: {new_track}")
+            self.last_logged_track = new_track
+            self.last_logged_paused = None  # Reset pause state when track changes
+        
+        if new_paused != self.last_logged_paused:
+            if new_paused:
+                print(f"⏸️  Pause ({self.mixer.pause_duration}s)...")
+            self.last_logged_paused = new_paused
+
     async def _broadcast_loop(self):
         """
         Background task that continuously generates audio chunks.
-        This runs independently and fills the buffer.
+        Generates at approximately real-time speed to keep logs synchronized
+        with actual playback timing.
         """
         print("🎵 Starting continuous audio generation...")
 
         try:
             # Generate audio stream
             stream = self.mixer.generate_stream(chunk_size=self.chunk_size)
+            last_track = None
+            last_paused = None
+            last_chunk_time = time.time()
 
             for chunk in stream:
                 if not self.running:
@@ -109,6 +142,12 @@ class SharedRadioBroadcast:
                 # Get current track info from mixer
                 current_track = self.mixer.current_track or "Waiting..."
                 is_paused = self.mixer.is_paused
+
+                # Log state changes when they occur (once per state change)
+                if current_track != last_track or is_paused != last_paused:
+                    self._check_and_log_state_change(current_track, is_paused)
+                    last_track = current_track
+                    last_paused = is_paused
 
                 # Add chunk to buffer with sequence number and track metadata
                 self.buffer.append({
@@ -124,11 +163,25 @@ class SharedRadioBroadcast:
                 # Signal that new chunk is available
                 self.new_chunk_event.set()
 
-                # Small delay to prevent tight loop
-                await asyncio.sleep(0.001)
+                # Wait approximately the duration of this chunk to generate at real-time speed
+                # This ensures logs appear at the right time relative to playback
+                current_time = time.time()
+                elapsed = current_time - last_chunk_time
+                sleep_time = max(0, self.seconds_per_chunk - elapsed)
+                
+                # Only sleep if we're generating faster than real-time
+                # If buffer is getting low, we can generate faster
+                if len(self.buffer) < self.buffer_size * 0.5:
+                    # Buffer is getting low, generate faster (minimal sleep)
+                    await asyncio.sleep(0.001)
+                else:
+                    # Buffer is healthy, generate at real-time speed
+                    await asyncio.sleep(sleep_time)
+                
+                last_chunk_time = time.time()
 
         except Exception as e:
-            print(f"Error in broadcast loop: {e}")
+            print(f"❌ Error in broadcast loop: {e}")
             raise
 
     async def subscribe(self) -> AsyncIterator[bytes]:
@@ -149,7 +202,8 @@ class SharedRadioBroadcast:
             # No chunks yet, wait for first one
             last_seq = -1
 
-        print(f"🎧 New client subscribed at sequence {last_seq}")
+        # Only log client subscriptions occasionally to avoid spam
+        # (Removed verbose logging for each client connection)
 
         # Stream chunks as they become available
         while self.running:
@@ -166,12 +220,6 @@ class SharedRadioBroadcast:
             for chunk in sorted(new_chunks, key=lambda x: x['seq']):
                 yield chunk['data']
                 last_seq = chunk['seq']
-
-                # Update broadcast state based on what's actually being sent
-                if chunk['seq'] > self.last_broadcast_seq:
-                    self.last_broadcast_seq = chunk['seq']
-                    self.broadcast_track = chunk['track']
-                    self.broadcast_paused = chunk['paused']
 
             # Clear event and wait for next batch
             self.new_chunk_event.clear()

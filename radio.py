@@ -6,11 +6,24 @@ All clients tap into the same live broadcast
 
 from fasthtml.common import *
 from starlette.responses import StreamingResponse
+from starlette.middleware.cors import CORSMiddleware
 import asyncio
 from pathlib import Path
 from shared_broadcast import get_broadcast
+import uvicorn
 
 app, rt = fast_app(debug=True)
+
+# CORS configuration - allow cross-origin requests
+# For production, replace "*" with specific origins like ["https://nice-hail-leaves-j74fng.solve.it.com"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins (use specific list in production)
+    allow_credentials=False,  # Set to True only if using specific origins
+    allow_methods=["GET", "POST", "OPTIONS"],  # Allow common HTTP methods
+    allow_headers=["*"],  # Allow all headers
+    expose_headers=["*"],  # Expose all headers to client
+)
 
 # Configuration
 MUSIC_DIR = Path("music")
@@ -72,6 +85,7 @@ async def radio_stream():
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "Content-Disposition": 'inline; filename="radio-stream.wav"',
+            "Access-Control-Allow-Origin": "*",  # CORS header for streaming
         }
     )
 
@@ -297,8 +311,54 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print("Access the radio at:")
-    print("  Local:    http://localhost:5002")
-    print("  Network:  http://<your-ip>:5002")
-    print("  Stream:   http://<your-ip>:5002/radio/stream")
+    print("  Local:    https://localhost:5002")
+    
+    # Get all IP addresses for display
+    import socket
+    hostname = socket.gethostname()
+    local_ip = socket.gethostbyname(hostname)
+    
+    # Get all IPs
+    import subprocess
+    try:
+        result = subprocess.run(['ip', '-4', 'addr', 'show'], capture_output=True, text=True)
+        ips = []
+        for line in result.stdout.split('\n'):
+            if 'inet ' in line and '127.0.0.1' not in line:
+                ip = line.split()[1].split('/')[0]
+                if ip not in ['127.0.0.1']:
+                    ips.append(ip)
+        
+        if ips:
+            print("  Network IPs:")
+            for ip in ips[:3]:  # Show first 3 IPs
+                print(f"    https://{ip}:5002")
+            if len(ips) > 3:
+                print(f"    ... and {len(ips) - 3} more")
+    except:
+        print(f"  Network:  https://{local_ip}:5002")
+    
+    print("  Stream:   https://<your-ip>:5002/radio/stream")
+    print("")
+    print("⚠️  IMPORTANT: Browser Certificate Warning")
+    print("   Browsers will show a security warning for self-signed certificates.")
+    print("   For IP addresses, this warning is harder to bypass.")
+    print("")
+    print("💡 Solutions:")
+    print("   1. Use hostname: Add '192.168.x.x radio.local' to /etc/hosts")
+    print("      Then access: https://radio.local:5002")
+    print("   2. Import certificate to browser trust store")
+    print("   3. See ACCESS_GUIDE.md for detailed instructions")
     print("=" * 60)
-    serve(port=5002)
+
+    # SSL configuration
+    ssl_keyfile = Path(__file__).parent / "key.pem"
+    ssl_certfile = Path(__file__).parent / "cert.pem"
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=5002,
+        ssl_keyfile=str(ssl_keyfile),
+        ssl_certfile=str(ssl_certfile)
+    )

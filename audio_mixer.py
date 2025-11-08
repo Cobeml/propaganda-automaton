@@ -195,12 +195,7 @@ class RadioMixer:
                 # Update current track state
                 self.current_track = voice_file.name
                 self.is_paused = False
-
-                if first_track:
-                    print(f"Now playing: {voice_file.name}")
-                    first_track = False
-                else:
-                    print(f"Now playing: {voice_file.name}")
+                first_track = False
 
                 # Load voice track
                 voice_data, voice_sr = sf.read(str(voice_file))
@@ -222,7 +217,6 @@ class RadioMixer:
 
                 # Add pause with background music
                 self.is_paused = True
-                print(f"  Pause ({self.pause_duration}s)...")
 
                 pause_with_music = self._get_music_segment(
                     self.pause_samples, music_offset
@@ -234,7 +228,7 @@ class RadioMixer:
                     chunk = pause_with_music[i:i + chunk_size]
                     yield self._audio_to_pcm_bytes(chunk)
 
-            print("Voice playlist completed, looping...")
+            # Playlist completed, will loop
 
 
 def test_mixer():

@@ -1,13 +1,14 @@
 """
 Web Radio Streaming Server
 Streams audio files continuously via HTTP endpoint with background music and voice overlays
+All clients tap into the same live broadcast
 """
 
 from fasthtml.common import *
 from starlette.responses import StreamingResponse
 import asyncio
 from pathlib import Path
-from audio_mixer import RadioMixer
+from shared_broadcast import get_broadcast
 
 app, rt = fast_app(debug=True)
 
@@ -19,65 +20,58 @@ MUSIC_VOLUME = 0.15  # Background music volume (0.0-1.0)
 VOICE_VOLUME = 1.0   # Voice track volume (0.0-1.0)
 PAUSE_DURATION = 10.0  # Seconds between voice tracks
 
+# Broadcast instance (initialized on startup)
+broadcast = None
 
-async def mixed_audio_stream_generator():
-    """
-    Generate an infinite stream of mixed audio (background music + voices).
 
-    Yields:
-        Audio data chunks
-    """
-    # Get music file
+@app.on_event("startup")
+async def startup_event():
+    """Initialize and start the shared broadcast on server startup"""
+    global broadcast
+
     music_files = list(MUSIC_DIR.glob("*.wav"))
     if not music_files:
-        raise FileNotFoundError("No music files found")
+        print("⚠️  No music files found!")
+        return
 
-    music_file = music_files[0]
-
-    # Check for voice files
-    voice_files = list(VOICES_DIR.glob("*.wav"))
-    if not voice_files:
-        print("Warning: No voice files found, creating placeholder...")
-        # We'll just stream music if no voices available
-        # In production, you'd want to handle this differently
-
-    # Create mixer
-    mixer = RadioMixer(
-        music_file=music_file,
+    # Create broadcast
+    broadcast = get_broadcast(
+        music_file=music_files[0],
         voices_dir=VOICES_DIR,
         music_volume=MUSIC_VOLUME,
         voice_volume=VOICE_VOLUME,
         pause_duration=PAUSE_DURATION
     )
 
-    # Stream mixed audio
-    for chunk in mixer.generate_stream(chunk_size=CHUNK_SIZE):
-        yield chunk
-        await asyncio.sleep(0.001)  # Small delay to prevent blocking
+    # Start background broadcast
+    await broadcast.start()
+    print("✅ Radio broadcast is live!")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stop the broadcast on server shutdown"""
+    if broadcast:
+        await broadcast.stop()
 
 
 @rt("/radio/stream")
 async def radio_stream():
     """
-    Stream audio endpoint - plays music files on infinite loop.
-    Access this endpoint to listen to the radio.
+    Stream audio endpoint - taps into the live broadcast.
+    All clients hear the same audio at the same time.
     """
-    # Get the first WAV file in the music directory
-    music_files = list(MUSIC_DIR.glob("*.wav"))
+    if broadcast is None:
+        return Response("Broadcast not initialized", status_code=503)
 
-    if not music_files:
-        return Response("No music files found in music directory", status_code=404)
-
-    # Use the first music file found
-    music_file = music_files[0]
-
+    # Subscribe to the live broadcast
     return StreamingResponse(
-        audio_stream_generator(music_file),
+        broadcast.subscribe(),
         media_type="audio/wav",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "Content-Disposition": f'inline; filename="radio-stream.wav"',
+            "Content-Disposition": 'inline; filename="radio-stream.wav"',
         }
     )
 
@@ -245,17 +239,33 @@ def get():
 def radio_info():
     """API endpoint to get information about current stream"""
     music_files = list(MUSIC_DIR.glob("*.wav"))
+    voice_files = list(VOICES_DIR.glob("*.wav"))
 
     if not music_files:
         return {"error": "No music files found"}
 
-    return {
+    # Get current playback state from broadcast
+    current_track = "Waiting for broadcast..."
+    is_paused = False
+    if broadcast is not None:
+        current_track, is_paused = broadcast.get_current_track()
+
+    info = {
         "status": "live",
-        "current_track": music_files[0].name,
+        "background_music": music_files[0].name,
+        "voice_tracks": [v.name for v in sorted(voice_files)],
+        "voice_count": len(voice_files),
         "stream_url": "/radio/stream",
         "format": "WAV",
-        "mode": "continuous_loop"
+        "mode": "shared_broadcast",
+        "music_volume": MUSIC_VOLUME,
+        "voice_volume": VOICE_VOLUME,
+        "pause_duration": PAUSE_DURATION,
+        "now_playing": current_track,
+        "is_paused": is_paused
     }
+
+    return info
 
 
 if __name__ == "__main__":
@@ -263,11 +273,28 @@ if __name__ == "__main__":
     print("🎵 Web Radio Station Starting...")
     print("=" * 60)
     print(f"Music directory: {MUSIC_DIR.absolute()}")
+    print(f"Voices directory: {VOICES_DIR.absolute()}")
+    print()
+
     music_files = list(MUSIC_DIR.glob("*.wav"))
     if music_files:
-        print(f"Now playing: {music_files[0].name}")
+        print(f"🎼 Background music: {music_files[0].name}")
+        print(f"   Volume: {MUSIC_VOLUME * 100:.0f}%")
     else:
         print("⚠️  No music files found!")
+
+    print()
+    voice_files = sorted(VOICES_DIR.glob("*.wav"))
+    if voice_files:
+        print(f"🎙️  Voice tracks: {len(voice_files)} files")
+        for vf in voice_files:
+            print(f"   - {vf.name}")
+        print(f"   Volume: {VOICE_VOLUME * 100:.0f}%")
+        print(f"   Pause between: {PAUSE_DURATION}s")
+    else:
+        print("⚠️  No voice files found!")
+        print("   Generate some with: python audio_gen.py")
+
     print("=" * 60)
     print("Access the radio at:")
     print("  Local:    http://localhost:5002")

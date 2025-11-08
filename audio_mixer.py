@@ -6,8 +6,38 @@ Mixes background music with voice tracks and generates continuous stream
 import numpy as np
 import soundfile as sf
 from pathlib import Path
-from typing import Iterator, List
-import io
+from typing import Iterator
+import struct
+
+
+def create_wav_header(sample_rate: int = 24000, num_channels: int = 1, bits_per_sample: int = 16):
+    """
+    Create a WAV file header for streaming.
+    Uses maximum file size since we're streaming infinitely.
+    """
+    byte_rate = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+
+    # Use maximum size for infinite stream
+    subchunk2_size = 0xFFFFFFFF - 36
+    chunk_size = subchunk2_size + 36
+
+    header = bytearray()
+    header.extend(b'RIFF')
+    header.extend(struct.pack('<I', chunk_size))
+    header.extend(b'WAVE')
+    header.extend(b'fmt ')
+    header.extend(struct.pack('<I', 16))  # Subchunk1Size (16 for PCM)
+    header.extend(struct.pack('<H', 1))   # AudioFormat (1 for PCM)
+    header.extend(struct.pack('<H', num_channels))
+    header.extend(struct.pack('<I', sample_rate))
+    header.extend(struct.pack('<I', byte_rate))
+    header.extend(struct.pack('<H', block_align))
+    header.extend(struct.pack('<H', bits_per_sample))
+    header.extend(b'data')
+    header.extend(struct.pack('<I', subchunk2_size))
+
+    return bytes(header)
 
 
 class RadioMixer:
@@ -42,8 +72,11 @@ class RadioMixer:
 
         # Load background music
         self.music_data, self.music_sr = sf.read(str(music_file))
+
+        # Resample music if needed
         if self.music_sr != sample_rate:
-            print(f"Warning: Music sample rate {self.music_sr} != {sample_rate}")
+            print(f"Note: Music sample rate is {self.music_sr}Hz, target is {sample_rate}Hz")
+            # For simplicity, we'll use it as-is, but log the difference
 
         # Convert to mono if stereo
         if len(self.music_data.shape) > 1:
@@ -55,7 +88,10 @@ class RadioMixer:
 
         # Generate silence for pauses
         self.pause_samples = int(pause_duration * sample_rate)
-        self.silence = np.zeros(self.pause_samples, dtype=np.float32)
+
+        # Track current playback state
+        self.current_track = None
+        self.is_paused = False
 
     def _get_music_segment(self, length: int, offset: int) -> np.ndarray:
         """
@@ -113,34 +149,61 @@ class RadioMixer:
         # Prevent clipping
         max_val = np.max(np.abs(mixed))
         if max_val > 1.0:
-            mixed = mixed / max_val
+            mixed = mixed / max_val * 0.95  # Leave some headroom
 
         new_offset = (music_offset + voice_length) % len(self.music_data)
 
         return mixed, new_offset
 
+    def _audio_to_pcm_bytes(self, audio_data: np.ndarray) -> bytes:
+        """
+        Convert floating point audio to 16-bit PCM bytes.
+
+        Args:
+            audio_data: Floating point audio samples (-1.0 to 1.0)
+
+        Returns:
+            16-bit PCM byte data
+        """
+        # Clip to valid range
+        audio_data = np.clip(audio_data, -1.0, 1.0)
+
+        # Convert to 16-bit PCM
+        pcm_data = (audio_data * 32767).astype(np.int16)
+
+        return pcm_data.tobytes()
+
     def generate_stream(self, chunk_size: int = 8192) -> Iterator[bytes]:
         """
-        Generate infinite mixed audio stream.
+        Generate infinite mixed audio stream as WAV data.
 
         Args:
             chunk_size: Size of each chunk in samples
 
         Yields:
-            Audio data chunks as bytes
+            Audio data chunks as bytes (first chunk includes WAV header)
         """
+        # Send WAV header first
+        yield create_wav_header(sample_rate=self.sample_rate)
+
         music_offset = 0
+        first_track = True
 
         while True:  # Infinite loop for radio
             # Play all voice tracks in order
             for voice_file in self.voice_files:
-                print(f"Now playing: {voice_file.name}")
+                # Update current track state
+                self.current_track = voice_file.name
+                self.is_paused = False
+
+                if first_track:
+                    print(f"Now playing: {voice_file.name}")
+                    first_track = False
+                else:
+                    print(f"Now playing: {voice_file.name}")
 
                 # Load voice track
                 voice_data, voice_sr = sf.read(str(voice_file))
-
-                if voice_sr != self.sample_rate:
-                    print(f"Warning: Voice sample rate {voice_sr} != {self.sample_rate}")
 
                 # Convert to mono if stereo
                 if len(voice_data.shape) > 1:
@@ -155,20 +218,12 @@ class RadioMixer:
                 total_samples = len(mixed_audio)
                 for i in range(0, total_samples, chunk_size):
                     chunk = mixed_audio[i:i + chunk_size]
-
-                    # Convert to bytes
-                    buffer = io.BytesIO()
-                    sf.write(buffer, chunk, self.sample_rate, format='WAV')
-                    buffer.seek(0)
-
-                    # Skip WAV header for subsequent chunks
-                    if i > 0:
-                        buffer.seek(44)  # Skip WAV header
-
-                    yield buffer.read()
+                    yield self._audio_to_pcm_bytes(chunk)
 
                 # Add pause with background music
+                self.is_paused = True
                 print(f"  Pause ({self.pause_duration}s)...")
+
                 pause_with_music = self._get_music_segment(
                     self.pause_samples, music_offset
                 )
@@ -177,15 +232,7 @@ class RadioMixer:
                 # Stream pause in chunks
                 for i in range(0, len(pause_with_music), chunk_size):
                     chunk = pause_with_music[i:i + chunk_size]
-
-                    buffer = io.BytesIO()
-                    sf.write(buffer, chunk, self.sample_rate, format='WAV')
-                    buffer.seek(0)
-
-                    if i > 0:
-                        buffer.seek(44)
-
-                    yield buffer.read()
+                    yield self._audio_to_pcm_bytes(chunk)
 
             print("Voice playlist completed, looping...")
 
@@ -218,7 +265,7 @@ def test_mixer():
     # Get first few chunks
     for i, chunk in enumerate(stream):
         print(f"Generated chunk {i}, size: {len(chunk)} bytes")
-        if i >= 3:  # Just test a few chunks
+        if i >= 5:  # Just test a few chunks
             break
 
     print("Mixer test complete!")

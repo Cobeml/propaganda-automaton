@@ -33,6 +33,17 @@ MUSIC_VOLUME = 0.15  # Background music volume (0.0-1.0)
 VOICE_VOLUME = 1.0   # Voice track volume (0.0-1.0)
 PAUSE_DURATION = 10.0  # Seconds between voice tracks
 
+# Hardcoded recurring voice files (these loop continuously)
+RECURRING_VOICE_FILES = [
+    "voices/01_welcome.wav",
+    "voices/02_weather.wav",
+    "voices/03_safety.wav"
+]
+
+# Directory for sponsored messages (one-time playback)
+SPONSORED_DIR = Path("voices/sponsored")
+SPONSORED_DIR.mkdir(parents=True, exist_ok=True)
+
 # Broadcast instance (initialized on startup)
 broadcast = None
 
@@ -47,10 +58,10 @@ async def startup_event():
         print("⚠️  No music files found!")
         return
 
-    # Create broadcast
+    # Create broadcast with hardcoded recurring files
     broadcast = get_broadcast(
         music_file=music_files[0],
-        voices_dir=VOICES_DIR,
+        recurring_voice_files=RECURRING_VOICE_FILES,
         music_volume=MUSIC_VOLUME,
         voice_volume=VOICE_VOLUME,
         pause_duration=PAUSE_DURATION
@@ -59,6 +70,9 @@ async def startup_event():
     # Start background broadcast
     await broadcast.start()
     print("✅ Radio broadcast is live!")
+    print(f"📻 Recurring tracks: {len(RECURRING_VOICE_FILES)}")
+    for track in RECURRING_VOICE_FILES:
+        print(f"   - {Path(track).name}")
 
 
 @app.on_event("shutdown")
@@ -253,7 +267,6 @@ def get():
 def radio_info():
     """API endpoint to get information about current stream"""
     music_files = list(MUSIC_DIR.glob("*.wav"))
-    voice_files = list(VOICES_DIR.glob("*.wav"))
 
     if not music_files:
         return {"error": "No music files found"}
@@ -267,8 +280,8 @@ def radio_info():
     info = {
         "status": "live",
         "background_music": music_files[0].name,
-        "voice_tracks": [v.name for v in sorted(voice_files)],
-        "voice_count": len(voice_files),
+        "recurring_tracks": [Path(v).name for v in RECURRING_VOICE_FILES],
+        "recurring_count": len(RECURRING_VOICE_FILES),
         "stream_url": "/radio/stream",
         "format": "WAV",
         "mode": "shared_broadcast",
@@ -280,6 +293,35 @@ def radio_info():
     }
 
     return info
+
+
+@rt("/radio/add_sponsored")
+async def add_sponsored(audio_file: str):
+    """
+    API endpoint to add a sponsored message to the broadcast queue.
+    
+    Query params:
+        audio_file: Path to the audio file to add
+    
+    Returns:
+        JSON with success status
+    """
+    if broadcast is None:
+        return {"success": False, "error": "Broadcast not initialized"}
+    
+    audio_path = Path(audio_file)
+    if not audio_path.exists():
+        return {"success": False, "error": f"Audio file not found: {audio_file}"}
+    
+    try:
+        broadcast.add_sponsored_message(str(audio_path))
+        return {
+            "success": True,
+            "message": f"Sponsored message added: {audio_path.name}",
+            "file": str(audio_path)
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 if __name__ == "__main__":

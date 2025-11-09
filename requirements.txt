@@ -1,0 +1,10 @@
+python-fasthtml
+web3>=6.0.0
+python-dotenv
+fasthtml-jupyter
+requests
+urllib3
+soundfile
+numpy
+kokoro-onnx
+

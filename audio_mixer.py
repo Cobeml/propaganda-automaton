@@ -46,7 +46,8 @@ class RadioMixer:
     def __init__(
         self,
         music_file: Path,
-        voices_dir: Path,
+        voices_dir: Path = None,
+        recurring_voice_files: list = None,
         music_volume: float = 0.2,
         voice_volume: float = 1.0,
         pause_duration: float = 10.0,
@@ -57,7 +58,8 @@ class RadioMixer:
 
         Args:
             music_file: Path to background music file
-            voices_dir: Directory containing voice track files
+            voices_dir: Directory containing voice track files (deprecated, use recurring_voice_files)
+            recurring_voice_files: List of voice file paths that loop continuously
             music_volume: Volume multiplier for background music (0.0-1.0)
             voice_volume: Volume multiplier for voice tracks (0.0-1.0)
             pause_duration: Seconds of silence between voice tracks
@@ -82,9 +84,19 @@ class RadioMixer:
         if len(self.music_data.shape) > 1:
             self.music_data = np.mean(self.music_data, axis=1)
 
-        # Get voice files
-        self.voice_files = sorted(voices_dir.glob("*.wav"))
-        print(f"Found {len(self.voice_files)} voice tracks")
+        # Recurring voice files (loop continuously)
+        if recurring_voice_files:
+            self.voice_files = [Path(f) for f in recurring_voice_files]
+        elif voices_dir:
+            # Fallback to old behavior for compatibility
+            self.voice_files = sorted(voices_dir.glob("*.wav"))
+        else:
+            self.voice_files = []
+        
+        print(f"Loaded {len(self.voice_files)} recurring voice tracks")
+
+        # Queue for one-time sponsored messages (FIFO)
+        self.sponsored_queue = []
 
         # Generate silence for pauses
         self.pause_samples = int(pause_duration * sample_rate)
@@ -92,6 +104,17 @@ class RadioMixer:
         # Track current playback state
         self.current_track = None
         self.is_paused = False
+
+    def add_sponsored_message(self, audio_file_path: str):
+        """
+        Add a one-time sponsored message to play next.
+        
+        Args:
+            audio_file_path: Path to the sponsored audio file
+        """
+        self.sponsored_queue.append(Path(audio_file_path))
+        print(f"📢 Added sponsored message to queue: {audio_file_path}")
+        print(f"   Queue size: {len(self.sponsored_queue)}")
 
     def _get_music_segment(self, length: int, offset: int) -> np.ndarray:
         """
@@ -173,9 +196,57 @@ class RadioMixer:
 
         return pcm_data.tobytes()
 
+    def _play_voice_track(self, voice_file: Path, music_offset: int, chunk_size: int) -> Iterator[tuple[bytes, int]]:
+        """
+        Play a single voice track with music mixing.
+        
+        Args:
+            voice_file: Path to voice file
+            music_offset: Current position in background music
+            chunk_size: Size of audio chunks
+            
+        Yields:
+            Tuple of (audio_chunk, new_music_offset)
+        """
+        # Update current track state
+        self.current_track = voice_file.name
+        self.is_paused = False
+
+        # Load voice track
+        voice_data, voice_sr = sf.read(str(voice_file))
+
+        # Convert to mono if stereo
+        if len(voice_data.shape) > 1:
+            voice_data = np.mean(voice_data, axis=1)
+
+        # Mix voice with music
+        mixed_audio, music_offset = self._mix_voice_with_music(
+            voice_data, music_offset
+        )
+
+        # Stream mixed audio in chunks
+        total_samples = len(mixed_audio)
+        for i in range(0, total_samples, chunk_size):
+            chunk = mixed_audio[i:i + chunk_size]
+            yield self._audio_to_pcm_bytes(chunk), music_offset
+
+        # Add pause with background music
+        self.is_paused = True
+
+        pause_with_music = self._get_music_segment(
+            self.pause_samples, music_offset
+        )
+        music_offset = (music_offset + self.pause_samples) % len(self.music_data)
+
+        # Stream pause in chunks
+        for i in range(0, len(pause_with_music), chunk_size):
+            chunk = pause_with_music[i:i + chunk_size]
+            yield self._audio_to_pcm_bytes(chunk), music_offset
+
     def generate_stream(self, chunk_size: int = 8192) -> Iterator[bytes]:
         """
         Generate infinite mixed audio stream as WAV data.
+        Prioritizes sponsored messages (one-time) over recurring tracks.
 
         Args:
             chunk_size: Size of each chunk in samples
@@ -190,43 +261,25 @@ class RadioMixer:
         first_track = True
 
         while True:  # Infinite loop for radio
-            # Play all voice tracks in order
+            # Check for sponsored messages first (priority)
+            if self.sponsored_queue:
+                sponsored_file = self.sponsored_queue.pop(0)
+                print(f"🎙️ Playing sponsored message: {sponsored_file.name}")
+                print(f"   Remaining in queue: {len(self.sponsored_queue)}")
+                
+                for chunk, music_offset in self._play_voice_track(sponsored_file, music_offset, chunk_size):
+                    yield chunk
+                    
+                continue  # Go back to check for more sponsored messages
+            
+            # Play recurring voice tracks
             for voice_file in self.voice_files:
-                # Update current track state
-                self.current_track = voice_file.name
-                self.is_paused = False
-                first_track = False
-
-                # Load voice track
-                voice_data, voice_sr = sf.read(str(voice_file))
-
-                # Convert to mono if stereo
-                if len(voice_data.shape) > 1:
-                    voice_data = np.mean(voice_data, axis=1)
-
-                # Mix voice with music
-                mixed_audio, music_offset = self._mix_voice_with_music(
-                    voice_data, music_offset
-                )
-
-                # Stream mixed audio in chunks
-                total_samples = len(mixed_audio)
-                for i in range(0, total_samples, chunk_size):
-                    chunk = mixed_audio[i:i + chunk_size]
-                    yield self._audio_to_pcm_bytes(chunk)
-
-                # Add pause with background music
-                self.is_paused = True
-
-                pause_with_music = self._get_music_segment(
-                    self.pause_samples, music_offset
-                )
-                music_offset = (music_offset + self.pause_samples) % len(self.music_data)
-
-                # Stream pause in chunks
-                for i in range(0, len(pause_with_music), chunk_size):
-                    chunk = pause_with_music[i:i + chunk_size]
-                    yield self._audio_to_pcm_bytes(chunk)
+                # Check for sponsored messages again before each regular track
+                if self.sponsored_queue:
+                    break  # Exit to prioritize sponsored message
+                
+                for chunk, music_offset in self._play_voice_track(voice_file, music_offset, chunk_size):
+                    yield chunk
 
             # Playlist completed, will loop
 

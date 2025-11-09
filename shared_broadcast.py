@@ -21,7 +21,8 @@ class SharedRadioBroadcast:
     def __init__(
         self,
         music_file: Path,
-        voices_dir: Path,
+        voices_dir: Path = None,
+        recurring_voice_files: list = None,
         music_volume: float = 0.15,
         voice_volume: float = 1.0,
         pause_duration: float = 10.0,
@@ -33,7 +34,8 @@ class SharedRadioBroadcast:
 
         Args:
             music_file: Path to background music
-            voices_dir: Directory with voice tracks
+            voices_dir: Directory with voice tracks (deprecated)
+            recurring_voice_files: List of voice file paths that loop
             music_volume: Background music volume
             voice_volume: Voice track volume
             pause_duration: Seconds between tracks
@@ -43,6 +45,7 @@ class SharedRadioBroadcast:
         self.mixer = RadioMixer(
             music_file=music_file,
             voices_dir=voices_dir,
+            recurring_voice_files=recurring_voice_files,
             music_volume=music_volume,
             voice_volume=voice_volume,
             pause_duration=pause_duration
@@ -134,22 +137,33 @@ class SharedRadioBroadcast:
             last_track = None
             last_paused = None
             last_chunk_time = time.time()
+            header_sent = False
 
             for chunk in stream:
                 if not self.running:
                     break
 
-                # Get current track info from mixer
-                current_track = self.mixer.current_track or "Waiting..."
+                # Skip state tracking for WAV header (first chunk)
+                if not header_sent:
+                    header_sent = True
+                    # Add header to buffer but don't update track state yet
+                    self.buffer.append({
+                        'seq': self.current_seq,
+                        'data': chunk,
+                        'timestamp': time.time(),
+                        'track': None,  # Header has no track
+                        'paused': False
+                    })
+                    self.current_seq += 1
+                    self.new_chunk_event.set()
+                    await asyncio.sleep(0.001)  # Minimal delay for header
+                    continue
+
+                # Get current track info from mixer (should be set by now)
+                current_track = self.mixer.current_track
                 is_paused = self.mixer.is_paused
 
-                # Log state changes when they occur (once per state change)
-                if current_track != last_track or is_paused != last_paused:
-                    self._check_and_log_state_change(current_track, is_paused)
-                    last_track = current_track
-                    last_paused = is_paused
-
-                # Add chunk to buffer with sequence number and track metadata
+                # Always add chunk to buffer (even if track is None initially)
                 self.buffer.append({
                     'seq': self.current_seq,
                     'data': chunk,
@@ -159,6 +173,18 @@ class SharedRadioBroadcast:
                 })
 
                 self.current_seq += 1
+
+                # Update broadcast state (used by get_current_track() API)
+                # Only update if we have a real track (not None)
+                if current_track is not None:
+                    self.broadcast_track = current_track
+                    self.broadcast_paused = is_paused
+
+                    # Log state changes when they occur (once per state change)
+                    if current_track != last_track or is_paused != last_paused:
+                        self._check_and_log_state_change(current_track, is_paused)
+                        last_track = current_track
+                        last_paused = is_paused
 
                 # Signal that new chunk is available
                 self.new_chunk_event.set()
@@ -236,6 +262,16 @@ class SharedRadioBroadcast:
 
         return self.broadcast_track, self.broadcast_paused
 
+    def add_sponsored_message(self, audio_file_path: str):
+        """
+        Add a one-time sponsored message to the broadcast queue.
+        Will play after the current track finishes.
+        
+        Args:
+            audio_file_path: Path to the sponsored audio file
+        """
+        self.mixer.add_sponsored_message(audio_file_path)
+
 
 # Global broadcast instance
 _broadcast_instance = None
@@ -244,6 +280,7 @@ _broadcast_instance = None
 def get_broadcast(
     music_file: Path = None,
     voices_dir: Path = None,
+    recurring_voice_files: list = None,
     music_volume: float = 0.15,
     voice_volume: float = 1.0,
     pause_duration: float = 10.0
@@ -252,12 +289,16 @@ def get_broadcast(
     global _broadcast_instance
 
     if _broadcast_instance is None:
-        if music_file is None or voices_dir is None:
-            raise ValueError("Must provide music_file and voices_dir on first call")
+        if music_file is None:
+            raise ValueError("Must provide music_file on first call")
+        
+        if voices_dir is None and recurring_voice_files is None:
+            raise ValueError("Must provide either voices_dir or recurring_voice_files on first call")
 
         _broadcast_instance = SharedRadioBroadcast(
             music_file=music_file,
             voices_dir=voices_dir,
+            recurring_voice_files=recurring_voice_files,
             music_volume=music_volume,
             voice_volume=voice_volume,
             pause_duration=pause_duration

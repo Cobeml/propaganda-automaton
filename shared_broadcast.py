@@ -7,7 +7,7 @@ import asyncio
 from collections import deque
 from pathlib import Path
 from audio_mixer import RadioMixer
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 import time
 
 
@@ -27,7 +27,8 @@ class SharedRadioBroadcast:
         voice_volume: float = 1.0,
         pause_duration: float = 10.0,
         chunk_size: int = 8192,
-        buffer_size: int = 100
+        buffer_size: int = 100,
+        icecast_client = None
     ):
         """
         Initialize the shared broadcast.
@@ -41,6 +42,7 @@ class SharedRadioBroadcast:
             pause_duration: Seconds between tracks
             chunk_size: Size of audio chunks
             buffer_size: Number of chunks to keep in buffer
+            icecast_client: Optional IcecastSourceClient instance
         """
         self.mixer = RadioMixer(
             music_file=music_file,
@@ -87,15 +89,22 @@ class SharedRadioBroadcast:
         from audio_mixer import create_wav_header
         self.wav_header = create_wav_header(sample_rate=24000)
 
+        # Icecast client (optional)
+        self.icecast_client = icecast_client
+        self.icecast_header_sent = False
+
     async def start(self):
-        """Start the background broadcast task"""
+        """Start the background broadcast task and Icecast client if enabled"""
         if self.broadcast_task is None:
             self.running = True
+            # Start Icecast client if configured
+            if self.icecast_client:
+                await self.icecast_client.start()
             self.broadcast_task = asyncio.create_task(self._broadcast_loop())
             print("📻 Shared broadcast started")
 
     async def stop(self):
-        """Stop the background broadcast task"""
+        """Stop the background broadcast task and Icecast client"""
         self.running = False
         if self.broadcast_task:
             self.broadcast_task.cancel()
@@ -103,7 +112,10 @@ class SharedRadioBroadcast:
                 await self.broadcast_task
             except asyncio.CancelledError:
                 pass
-            print("📻 Shared broadcast stopped")
+        # Stop Icecast client if configured
+        if self.icecast_client:
+            await self.icecast_client.stop()
+        print("📻 Shared broadcast stopped")
 
     def _check_and_log_state_change(self, new_track: str, new_paused: bool):
         """
@@ -156,6 +168,8 @@ class SharedRadioBroadcast:
                     })
                     self.current_seq += 1
                     self.new_chunk_event.set()
+                    # Skip WAV header for Icecast (it only needs PCM data)
+                    self.icecast_header_sent = False
                     await asyncio.sleep(0.001)  # Minimal delay for header
                     continue
 
@@ -173,6 +187,12 @@ class SharedRadioBroadcast:
                 })
 
                 self.current_seq += 1
+
+                # Send to Icecast client if configured (skip WAV header)
+                if self.icecast_client and self.icecast_client.is_connected():
+                    # Chunk is already PCM bytes (from _audio_to_pcm_bytes)
+                    metadata = current_track if current_track else None
+                    await self.icecast_client.send_audio_chunk(chunk, metadata=metadata)
 
                 # Update broadcast state (used by get_current_track() API)
                 # Only update if we have a real track (not None)
@@ -283,9 +303,21 @@ def get_broadcast(
     recurring_voice_files: list = None,
     music_volume: float = 0.15,
     voice_volume: float = 1.0,
-    pause_duration: float = 10.0
+    pause_duration: float = 10.0,
+    icecast_client = None
 ) -> SharedRadioBroadcast:
-    """Get or create the global broadcast instance"""
+    """
+    Get or create the global broadcast instance
+    
+    Args:
+        music_file: Path to background music file
+        voices_dir: Directory with voice tracks (deprecated)
+        recurring_voice_files: List of voice file paths that loop
+        music_volume: Background music volume
+        voice_volume: Voice track volume
+        pause_duration: Seconds between tracks
+        icecast_client: Optional IcecastSourceClient instance
+    """
     global _broadcast_instance
 
     if _broadcast_instance is None:
@@ -301,7 +333,8 @@ def get_broadcast(
             recurring_voice_files=recurring_voice_files,
             music_volume=music_volume,
             voice_volume=voice_volume,
-            pause_duration=pause_duration
+            pause_duration=pause_duration,
+            icecast_client=icecast_client
         )
 
     return _broadcast_instance

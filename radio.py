@@ -10,6 +10,7 @@ from starlette.middleware.cors import CORSMiddleware
 import asyncio
 from pathlib import Path
 from shared_broadcast import get_broadcast
+from icecast_client import IcecastSourceClient
 import uvicorn
 
 app, rt = fast_app(debug=True)
@@ -32,6 +33,15 @@ CHUNK_SIZE = 8192  # 8KB chunks for streaming
 MUSIC_VOLUME = 0.15  # Background music volume (0.0-1.0)
 VOICE_VOLUME = 1.0   # Voice track volume (0.0-1.0)
 PAUSE_DURATION = 10.0  # Seconds between voice tracks
+
+# Icecast configuration
+ICECAST_ENABLED = True  # Set to False to disable Icecast streaming
+ICECAST_HOST = "localhost"
+ICECAST_PORT = 8000
+ICECAST_MOUNT = "/radio.mp3"
+ICECAST_FORMAT = "mp3"
+ICECAST_BITRATE = 128
+ICECAST_SOURCE_PASSWORD = "hackme"  # Change in production
 
 # Hardcoded recurring voice files (these loop continuously)
 RECURRING_VOICE_FILES = [
@@ -58,13 +68,32 @@ async def startup_event():
         print("⚠️  No music files found!")
         return
 
+    # Initialize Icecast client if enabled
+    icecast_client = None
+    if ICECAST_ENABLED:
+        try:
+            icecast_client = IcecastSourceClient(
+                host=ICECAST_HOST,
+                port=ICECAST_PORT,
+                mount=ICECAST_MOUNT,
+                source_password=ICECAST_SOURCE_PASSWORD,
+                format=ICECAST_FORMAT,
+                bitrate=ICECAST_BITRATE,
+                sample_rate=24000
+            )
+            print(f"📻 Icecast client configured: {ICECAST_HOST}:{ICECAST_PORT}{ICECAST_MOUNT}")
+        except Exception as e:
+            print(f"⚠️  Error initializing Icecast client: {e}")
+            print("   Continuing without Icecast support...")
+
     # Create broadcast with hardcoded recurring files
     broadcast = get_broadcast(
         music_file=music_files[0],
         recurring_voice_files=RECURRING_VOICE_FILES,
         music_volume=MUSIC_VOLUME,
         voice_volume=VOICE_VOLUME,
-        pause_duration=PAUSE_DURATION
+        pause_duration=PAUSE_DURATION,
+        icecast_client=icecast_client
     )
 
     # Start background broadcast
@@ -73,6 +102,12 @@ async def startup_event():
     print(f"📻 Recurring tracks: {len(RECURRING_VOICE_FILES)}")
     for track in RECURRING_VOICE_FILES:
         print(f"   - {Path(track).name}")
+    
+    if ICECAST_ENABLED and icecast_client:
+        if icecast_client.is_connected():
+            print(f"✅ Icecast stream: http://{ICECAST_HOST}:{ICECAST_PORT}{ICECAST_MOUNT}")
+        else:
+            print("⚠️  Icecast client not connected (Icecast server may not be running)")
 
 
 @app.on_event("shutdown")
@@ -277,6 +312,16 @@ def radio_info():
     if broadcast is not None:
         current_track, is_paused = broadcast.get_current_track()
 
+    # Get Icecast status
+    icecast_status = {
+        "enabled": ICECAST_ENABLED,
+        "connected": False,
+        "url": None
+    }
+    if ICECAST_ENABLED and broadcast and broadcast.icecast_client:
+        icecast_status["connected"] = broadcast.icecast_client.is_connected()
+        icecast_status["url"] = f"http://{ICECAST_HOST}:{ICECAST_PORT}{ICECAST_MOUNT}"
+
     info = {
         "status": "live",
         "background_music": music_files[0].name,
@@ -289,10 +334,39 @@ def radio_info():
         "voice_volume": VOICE_VOLUME,
         "pause_duration": PAUSE_DURATION,
         "now_playing": current_track,
-        "is_paused": is_paused
+        "is_paused": is_paused,
+        "icecast": icecast_status
     }
 
     return info
+
+
+@rt("/radio/icecast")
+def radio_icecast():
+    """API endpoint to get Icecast stream information"""
+    if not ICECAST_ENABLED:
+        return {
+            "enabled": False,
+            "message": "Icecast streaming is disabled"
+        }
+    
+    icecast_url = f"http://{ICECAST_HOST}:{ICECAST_PORT}{ICECAST_MOUNT}"
+    connected = False
+    
+    if broadcast and broadcast.icecast_client:
+        connected = broadcast.icecast_client.is_connected()
+    
+    return {
+        "enabled": True,
+        "connected": connected,
+        "url": icecast_url,
+        "format": ICECAST_FORMAT,
+        "bitrate": ICECAST_BITRATE,
+        "host": ICECAST_HOST,
+        "port": ICECAST_PORT,
+        "mount": ICECAST_MOUNT,
+        "message": "Connect to this URL with VLC, iTunes, or any Icecast-compatible player" if connected else "Icecast server not connected. Please ensure Icecast is running."
+    }
 
 
 @rt("/radio/add_sponsored")
@@ -381,6 +455,11 @@ if __name__ == "__main__":
         print(f"  Network:  https://{local_ip}:5002")
     
     print("  Stream:   https://<your-ip>:5002/radio/stream")
+    
+    if ICECAST_ENABLED:
+        print(f"  Icecast:  http://{ICECAST_HOST}:{ICECAST_PORT}{ICECAST_MOUNT}")
+        print("            (For VLC, iTunes, and external players)")
+    
     print("")
     print("⚠️  IMPORTANT: Browser Certificate Warning")
     print("   Browsers will show a security warning for self-signed certificates.")
@@ -391,6 +470,13 @@ if __name__ == "__main__":
     print("      Then access: https://radio.local:5002")
     print("   2. Import certificate to browser trust store")
     print("   3. See ACCESS_GUIDE.md for detailed instructions")
+    if ICECAST_ENABLED:
+        print("")
+        print("📻 Icecast Setup:")
+        print("   1. Install Icecast: sudo apt-get install icecast2")
+        print("   2. Configure: Copy icecast.xml to /etc/icecast2/icecast.xml")
+        print("   3. Start: sudo systemctl start icecast2")
+        print("   4. Stream will be available at the Icecast URL above")
     print("=" * 60)
 
     # SSL configuration

@@ -6,6 +6,7 @@
 - `radio.py` - Main radio server (runs at https://radio.cobe.dev)
 - `audio_mixer.py` - Mixes music with voice tracks, handles sponsored queue
 - `shared_broadcast.py` - Manages shared broadcast stream
+- `icecast_client.py` - Icecast source client for standard streaming protocol
 - `audio_gen.py` - TTS generation using Kokoro
 - `generate_test_voices.py` - Utility to generate test voice files
 
@@ -18,6 +19,7 @@
 ### **Configuration**
 - `requirements.txt` - Python dependencies
 - `.env` - Environment variables (not in git)
+- `icecast.xml` - Icecast server configuration
 
 ---
 
@@ -47,6 +49,12 @@
 ### **System Services**
 - `setup_radio_service.sh` - Radio as systemd service
   - Commands: install, uninstall, status, logs, restart
+
+### **Icecast Streaming**
+- `setup_icecast.sh` - Icecast server installation and setup
+  - Installs Icecast2 and ffmpeg
+  - Configures icecast.xml
+  - Starts Icecast service
 
 ---
 
@@ -95,8 +103,17 @@
 
 ## 🌐 Live URLs
 
-- **Radio Stream:** https://radio.cobe.dev/radio/stream
+### **HTTP Streams (Custom)**
+- **Radio Stream (WAV):** https://radio.cobe.dev/radio/stream
 - **Radio API:** https://radio.cobe.dev/radio/info
+- **Icecast API:** https://radio.cobe.dev/radio/icecast
+
+### **Icecast Streams (Standard Protocol)**
+- **Icecast Stream (MP3):** http://localhost:8000/radio.mp3
+  - Compatible with VLC, iTunes, WinAmp, and other standard players
+  - Requires Icecast server to be running
+
+### **Local Services**
 - **Admin Panel:** http://localhost:5001 (local only)
 - **Frontend:** http://localhost:8002 (Jupyter notebook)
 
@@ -106,16 +123,19 @@
 
 ### Start Everything
 ```bash
-# 1. Start radio (background)
+# 1. Install and start Icecast (one-time setup)
+sudo ./setup_icecast.sh
+
+# 2. Start radio (background)
 sudo systemctl start radio
 
-# 2. Start Cloudflare tunnel (background)
+# 3. Start Cloudflare tunnel (background)
 sudo systemctl start cloudflared
 
-# 3. Start admin panel (when needed)
+# 4. Start admin panel (when needed)
 python admin.py
 
-# 4. Start Jupyter frontend (when needed)
+# 5. Start Jupyter frontend (when needed)
 jupyter notebook fasthtml_radio_player.ipynb
 ```
 
@@ -124,11 +144,17 @@ jupyter notebook fasthtml_radio_player.ipynb
 # Radio status
 sudo systemctl status radio
 
+# Icecast status
+sudo systemctl status icecast2
+
 # Tunnel status
 sudo systemctl status cloudflared
 
 # Test public URL
 curl https://radio.cobe.dev/radio/info
+
+# Test Icecast stream
+curl http://localhost:8000/radio.mp3
 ```
 
 ---
@@ -146,9 +172,10 @@ fasthtml/
 │   ├── Features: ADMIN_README.md, SPONSORED_MESSAGES_GUIDE.md
 │   └── Reference: CHANGES_SUMMARY.md, kokoro.md
 │
-├── Setup Scripts (3 .sh files)
+├── Setup Scripts (4 .sh files)
 │   ├── setup_cloudflare_tunnel.sh
 │   ├── setup_radio_service.sh
+│   ├── setup_icecast.sh
 │   └── test_sponsored_system.py
 │
 ├── Media & Assets
@@ -181,13 +208,26 @@ User submits bid (Web3)
          ↓
   shared_broadcast.py (live stream)
          ↓
-  radio.py (HTTP server)
+  ┌──────────────┬──────────────┐
+  │              │              │
+radio.py      icecast_client.py
+(HTTP WAV)    (MP3 encoding)
+  │              │
+  │              ↓
+  │         Icecast Server
+  │         (port 8000)
+  │              │
+  ↓              ↓
+Cloudflare    Standard
+Tunnel        Players
+  │         (VLC, iTunes)
+  ↓              │
+https://         │
+radio.cobe.dev   │
+  │              │
+  └──────┬───────┘
          ↓
-  Cloudflare Tunnel
-         ↓
-  https://radio.cobe.dev
-         ↓
-  Users listen!
+    Users listen!
 ```
 
 ---
@@ -199,6 +239,8 @@ User submits bid (Web3)
 3. **Everything runs as services** - Survives reboots
 4. **Test scripts included** - Easy to verify changes
 5. **Clean separation** - Frontend, backend, admin, blockchain
+6. **Dual streaming** - Both custom WAV and standard Icecast MP3 streams
+7. **Icecast for compatibility** - Use Icecast stream for VLC, iTunes, etc.
 
 ---
 
@@ -209,6 +251,54 @@ User submits bid (Web3)
 - Cloudflare hides server IP
 - Private keys in `.env` never exposed
 - Self-signed certs removed (not needed)
+- **Icecast passwords** - Change default passwords in `icecast.xml` for production
+  - Default source password: `hackme` (change this!)
+  - Default admin password: `hackme` (change this!)
+
+## 📻 Icecast Streaming
+
+### **Hybrid Approach**
+The radio server supports two streaming methods:
+
+1. **Custom HTTP Stream (WAV)** - `/radio/stream`
+   - Direct integration with web browsers
+   - Uncompressed WAV format
+   - Lower latency
+
+2. **Icecast Stream (MP3)** - `http://localhost:8000/radio.mp3`
+   - Standard streaming protocol
+   - Compressed MP3 format (128 kbps)
+   - Compatible with VLC, iTunes, WinAmp, mobile apps
+   - Better for external players
+
+### **Setup Icecast**
+```bash
+# Install and configure
+sudo ./setup_icecast.sh
+
+# Check status
+sudo systemctl status icecast2
+
+# View logs
+sudo journalctl -u icecast2 -f
+```
+
+### **Configuration**
+- Edit `icecast.xml` to change passwords, port, mount point
+- Edit `radio.py` to adjust Icecast settings (host, port, format, bitrate)
+- Set `ICECAST_ENABLED = False` to disable Icecast streaming
+
+### **Testing**
+```bash
+# Test Icecast stream with VLC
+vlc http://localhost:8000/radio.mp3
+
+# Test with curl
+curl http://localhost:8000/radio.mp3
+
+# Check API
+curl http://localhost:5002/radio/icecast
+```
 
 ---
 

@@ -18,4 +18,9 @@ soundfile
 numpy
 kokoro-onnx
 torch
+pydub
+# Note: pydub requires ffmpeg for MP3 encoding (install via: apt-get install ffmpeg)
+
+# PDF processing
+pypdf
 
